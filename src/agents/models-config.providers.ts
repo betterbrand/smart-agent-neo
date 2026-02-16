@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "../config/config.js";
+import type { SmartAgentNeoConfig } from "../config/config.js";
 import type { ModelDefinitionConfig } from "../config/types.models.js";
 import {
   DEFAULT_COPILOT_API_BASE_URL,
@@ -29,8 +29,16 @@ import {
   buildTogetherModelDefinition,
 } from "./together-models.js";
 import { discoverVeniceModels, VENICE_BASE_URL } from "./venice-models.js";
+import {
+  discoverMorpheusModels,
+  MORPHEUS_GATEWAY_BASE_URL,
+} from "./morpheus-models.js";
+import {
+  resolveMorpheusProxyConfig,
+  startMorpheusProxy,
+} from "./morpheus-proxy.js";
 
-type ModelsConfig = NonNullable<OpenClawConfig["models"]>;
+type ModelsConfig = NonNullable<SmartAgentNeoConfig["models"]>;
 export type ProviderConfig = NonNullable<ModelsConfig["providers"]>[string];
 
 const MINIMAX_PORTAL_BASE_URL = "https://api.minimax.io/anthropic";
@@ -656,6 +664,39 @@ export function buildNvidiaProvider(): ProviderConfig {
   };
 }
 
+/**
+ * Build the Morpheus provider.
+ *
+ * Two modes:
+ * 1. Gateway (default): MORPHEUS_API_KEY set, no MORPHEUS_ROUTER_URL.
+ *    Uses api.mor.org directly — standard OpenAI-compatible provider.
+ * 2. Local proxy-router: MORPHEUS_ROUTER_URL set.
+ *    Starts an embedded proxy that handles session management + model ID mapping,
+ *    then returns the proxy's localhost URL as the base URL.
+ */
+async function buildMorpheusProvider(): Promise<ProviderConfig> {
+  const proxyConfig = resolveMorpheusProxyConfig();
+
+  if (proxyConfig) {
+    // Local mode: start embedded proxy to handle sessions + model ID mapping
+    const handle = await startMorpheusProxy(proxyConfig);
+    const models = await discoverMorpheusModels(proxyConfig.routerUrl);
+    return {
+      baseUrl: handle.baseUrl,
+      api: "openai-completions",
+      models,
+    };
+  }
+
+  // Gateway mode: direct OpenAI-compatible API
+  const models = await discoverMorpheusModels();
+  return {
+    baseUrl: MORPHEUS_GATEWAY_BASE_URL,
+    api: "openai-completions",
+    models,
+  };
+}
+
 export async function resolveImplicitProviders(params: {
   agentDir: string;
   explicitProviders?: Record<string, ProviderConfig> | null;
@@ -807,6 +848,16 @@ export async function resolveImplicitProviders(params: {
     providers.nvidia = { ...buildNvidiaProvider(), apiKey: nvidiaKey };
   }
 
+  const morpheusKey =
+    resolveEnvApiKeyVarName("morpheus") ??
+    resolveApiKeyFromProfiles({ provider: "morpheus", store: authStore });
+  if (morpheusKey) {
+    providers.morpheus = {
+      ...(await buildMorpheusProvider()),
+      apiKey: morpheusKey,
+    };
+  }
+
   return providers;
 }
 
@@ -852,15 +903,15 @@ export async function resolveImplicitCopilotProvider(params: {
 
   // pi-coding-agent's ModelRegistry marks a model "available" only if its
   // `AuthStorage` has auth configured for that provider (via auth.json/env/etc).
-  // Our Copilot auth lives in OpenClaw's auth-profiles store instead, so we also
+  // Our Copilot auth lives in SmartAgentNeo's auth-profiles store instead, so we also
   // write a runtime-only auth.json entry for pi-coding-agent to pick up.
   //
-  // This is safe because it's (1) within OpenClaw's agent dir, (2) contains the
+  // This is safe because it's (1) within SmartAgentNeo's agent dir, (2) contains the
   // GitHub token (not the exchanged Copilot token), and (3) matches existing
   // patterns for OAuth-like providers in pi-coding-agent.
   // Note: we deliberately do not write pi-coding-agent's `auth.json` here.
-  // OpenClaw uses its own auth store and exchanges tokens at runtime.
-  // `models list` uses OpenClaw's auth heuristics for availability.
+  // SmartAgentNeo uses its own auth store and exchanges tokens at runtime.
+  // `models list` uses SmartAgentNeo's auth heuristics for availability.
 
   // We intentionally do NOT define custom models for Copilot in models.json.
   // pi-coding-agent treats providers with models as replacements requiring apiKey.
@@ -873,7 +924,7 @@ export async function resolveImplicitCopilotProvider(params: {
 
 export async function resolveImplicitBedrockProvider(params: {
   agentDir: string;
-  config?: OpenClawConfig;
+  config?: SmartAgentNeoConfig;
   env?: NodeJS.ProcessEnv;
 }): Promise<ProviderConfig | null> {
   const env = params.env ?? process.env;
